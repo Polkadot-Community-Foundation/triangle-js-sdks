@@ -8,6 +8,7 @@ export {
 export type { PappAdapter } from './papp.js';
 export { createPappAdapter } from './papp.js';
 
+export type { HostMetadata } from './sso/auth/impl.js';
 export type { AttestationStatus, PairingStatus } from './sso/auth/types.js';
 export type { UserSession } from './sso/sessionManager/userSession.js';
 export type { StoredUserSession } from './sso/userSessionRepository.js';
