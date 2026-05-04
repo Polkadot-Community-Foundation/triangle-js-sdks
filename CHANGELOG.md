@@ -1,3 +1,25 @@
+## 0.7.5 (2026-05-01)
+
+### 🚀 Features
+
+- **scale:** `instanceof` now works against an `ErrEnum` itself in addition to its variants — `err instanceof MyErrors` narrows to the union of all variant errors.
+
+### 🩹 Fixes
+
+- **host-container:** chain operations no longer surface transient `"No active follow for this chain"` errors when the host pauses and resumes (visibility blur, app backgrounding, network blips). The chain layer waits briefly for the papp's refollow and routes operations issued during that window through the new follow once it's established.
+- **host-container:** dead chain-head follow state is cleaned up after server-driven stops, so long-running papps no longer accumulate stale follow records across many reconnect cycles.
+- **product-sdk:** chain-head follows are now released on the product side as soon as the host signals a stop. Without this, every reconnect (sleep/wake, network blips) leaked a follow worth of pinned runtime metadata; over a long-running session this could grow into the gigabyte range.
+- **host-substrate-chain-connection:** `chains.pauseAll()` / `resumeAll()` continue to drive the socket over the full lifetime of the host. Previously, after a chain was destroyed and re-acquired (the typical pattern when the host caches one provider per chain), pause and resume could silently no-op.
+- **host-substrate-chain-connection:** subscriptions on non-chainHead RPCs (e.g. `state_subscribeStorage`, `statement_subscribeStatement`) keep emitting events after a reconnect. Previously they could silently go quiet because the server had assigned a new subscription ID that the consumer never adopted.
+- **statement-store:** after `lazyClient.disconnect()`, subsequent calls to `getClient()` / `getRequestFn()` / `getSubscribeFn()` create a fresh connection instead of returning a destroyed one.
+- **host-worker-sandbox:** each sandbox now runs in its own isolated QuickJS WASM instance instead of sharing a process-wide module. Previously, disposing a sandbox with live JS state (event listeners, in-flight async chains, captured closures) tripped QuickJS's `JS_FreeRuntime` assertion and aborted the shared WASM module — killing every other product worker (signing, accounts, chat) until page reload. The dispose path is now wrapped in try/catch so a contained abort no longer bubbles. Trade: ~50–200ms extra startup and ~2–3MB resident memory per sandbox.
+- **host-papp:** SSO `signPayload` / `signRaw` queue tasks now time out after 180s instead of wedging the per-session request queue forever.
+- **host-papp-react-ui:** bump `@novasamatech/tr-ui` to 0.2.7.
+
+### ❤️ Thank You
+
+- Sergey Zhuravlev @johnthecat
+
 ## 0.7.4 (2026-04-29)
 
 ### 🚀 Features
