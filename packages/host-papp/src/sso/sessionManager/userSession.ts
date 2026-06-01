@@ -26,6 +26,8 @@ import type { SigningPayloadRequest, SigningPayloadResponseData, SigningRawReque
 // payload is for an SDK version the mobile app doesn't support yet. After
 // this timeout the queue task fails, freeing the pool for the next request.
 const QUEUE_TASK_TIMEOUT_MS = 180_000;
+// Mobile SSO statements allow 256 KiB total; keep headroom for statement/session overhead.
+const MAX_SSO_REQUEST_SIZE = 254 * 1024;
 
 function withQueueTimeout<T>(resultAsync: ResultAsync<T, Error>, label: string): ResultAsync<T, Error> {
   const timeoutPromise = new Promise<Result<T, Error>>(resolve =>
@@ -95,6 +97,7 @@ function withHostActionTrace<T>(
 
 export type UserSession = StoredUserSession & {
   sendDisconnectMessage(): ResultAsync<void, Error>;
+  abortPendingRequests(): ResultAsync<void, Error>;
   signPayload(payload: SigningPayloadRequest): ResultAsync<SigningPayloadResponseData, Error>;
   signRaw(payload: SigningRawRequest): ResultAsync<SigningPayloadResponseData, Error>;
   createTransaction(payload: CreateTransactionRequest): ResultAsync<Uint8Array, Error>;
@@ -121,6 +124,13 @@ export function createUserSession({
   prover: StatementProver;
 }): UserSession {
   const requestQueue = createAsyncTaskPool({ poolSize: 1, retryCount: 0, retryDelay: 0 });
+  // Shared abort handle for everything currently on the request queue.
+  // abortPendingRequests() fires it to drop the in-flight task plus anything
+  // queued behind it, then swaps in a fresh controller so later requests aren't
+  // pre-aborted.
+  let requestAbort = new AbortController();
+  // Enqueue against the live abort signal so abortPendingRequests() can drop every pending task.
+  const enqueue = <T>(fn: () => ResultAsync<T, Error>) => requestQueue.call(fn, { signal: requestAbort.signal });
 
   const session = createSession({
     localAccount: userSession.localAccount,
@@ -128,6 +138,7 @@ export function createUserSession({
     statementStore,
     encryption,
     prover,
+    maxRequestSize: MAX_SSO_REQUEST_SIZE,
   });
 
   const processedMessages = fieldListView<string>({
@@ -138,13 +149,10 @@ export function createUserSession({
   });
 
   return {
-    id: userSession.id,
-    localAccount: userSession.localAccount,
-    remoteAccount: userSession.remoteAccount,
-    rootAccountId: userSession.rootAccountId,
+    ...userSession,
 
     signPayload(payload) {
-      return requestQueue.call(() => {
+      return enqueue(() => {
         const messageId = nanoid();
         const data = enumValue('v1', enumValue('SignRequest', enumValue('Payload', payload)));
         emitHostAction(messageId, actionKindFromMessageData(data), userSession.id);
@@ -175,7 +183,7 @@ export function createUserSession({
     },
 
     signRaw(payload) {
-      return requestQueue.call(() => {
+      return enqueue(() => {
         const messageId = nanoid();
         const data = enumValue('v1', enumValue('SignRequest', enumValue('Raw', payload)));
         emitHostAction(messageId, actionKindFromMessageData(data), userSession.id);
@@ -206,7 +214,7 @@ export function createUserSession({
     },
 
     createTransaction(payload) {
-      return requestQueue.call(() => {
+      return enqueue(() => {
         const messageId = nanoid();
         const request = session.request(RemoteMessageCodec, {
           messageId,
@@ -238,7 +246,7 @@ export function createUserSession({
     },
 
     sendDisconnectMessage() {
-      return requestQueue.call(() =>
+      return enqueue(() =>
         session
           .submitRequestMessage(RemoteMessageCodec, {
             messageId: nanoid(),
@@ -249,7 +257,7 @@ export function createUserSession({
     },
 
     getRingVrfAlias(productAccountId, productId) {
-      return requestQueue.call(() => {
+      return enqueue(() => {
         const messageId = nanoid();
         const data = enumValue(
           'v1',
@@ -282,7 +290,7 @@ export function createUserSession({
     },
 
     requestResourceAllocation(request) {
-      return requestQueue.call(() => {
+      return enqueue(() => {
         const messageId = nanoid();
         const sendRequest = session.request(RemoteMessageCodec, {
           messageId,
@@ -371,6 +379,18 @@ export function createUserSession({
             console.error('Error while updating processed sso messages:', error);
           });
       });
+    },
+
+    abortPendingRequests() {
+      // Drop the whole request queue: aborting the shared signal rejects the
+      // in-flight task and every request queued behind it, freeing the single
+      // slot immediately instead of waiting out the per-task 180s timeout. Swap
+      // in a fresh controller so subsequent requests aren't pre-aborted.
+      requestAbort.abort(new Error('Session request aborted'));
+      requestAbort = new AbortController();
+      // Then supersede the in-flight on-chain batch with an empty one and reject
+      // any session-level response waiters left orphaned by the dropped tasks.
+      return session.clearOutgoingStatement();
     },
 
     dispose() {
