@@ -1,17 +1,20 @@
+import { toHex } from '@novasamatech/scale';
 import type { Statement } from '@novasamatech/sdk-statement';
 import { nanoid } from 'nanoid';
 import { ResultAsync, err, errAsync, fromPromise, fromThrowable, ok, okAsync } from 'neverthrow';
-import { toHex } from 'polkadot-api/utils';
 import type { Codec, CodecType } from 'scale-ts';
 import { Struct, str } from 'scale-ts';
 
 import type { StatementStoreAdapter } from '../adapter/types.js';
-import { ExpiryTooLowError } from '../adapter/types.js';
 import { khash, stringToBytes } from '../crypto.js';
 import { nonNullable, toError } from '../helpers.js';
 import type { SessionId } from '../model/session.js';
 import { createSessionId } from '../model/session.js';
 import type { LocalSessionAccount, RemoteSessionAccount } from '../model/sessionAccount.js';
+import type { ExpiryAllocator } from '../submit/allocator.js';
+import { createExpiryAllocator } from '../submit/allocator.js';
+import { isPriorityTooLow, submitWithRetry } from '../submit/retry.js';
+import { submitStatementOnce } from '../submit/submitStatement.js';
 import type { Callback } from '../types.js';
 
 import type { Encryption } from './encyption.js';
@@ -42,10 +45,21 @@ export type SessionParams = {
    * throw.
    */
   sessionKey: Uint8Array;
+  /**
+   * Expiry source for this session's submits. Inject ONE shared allocator when
+   * several writers (sessions, raw submits) sign with the same account, so
+   * same-second submits cannot tie. Defaults to a private allocator —
+   * identical to the previous per-session behavior.
+   */
+  allocator?: ExpiryAllocator;
   maxRequestSize?: number;
 };
 
 const DEFAULT_MAX_REQUEST_SIZE = 4096;
+
+// Rejection reason shared by dispose() and the disposed guards on submit*, so a torn-down session
+// always fails new and in-flight work the same way.
+const SESSION_DISPOSED = 'Session disposed';
 
 // Bounded retry for transient transport failures (the spec mandates retrying queries
 // and submit_statement on connection failure). The TS adapter doesn't expose connection
@@ -61,20 +75,6 @@ const RETRY_DELAY_MS = 25;
  * `maxStatementSize - overhead` rather than the raw statement limit.
  */
 export const STATEMENT_OVERHEAD = 32 + 32 + 8 + 64 + 32; // 168 bytes
-
-/**
- * Statement expiry/priority, u64 = (expiration_epoch << 32) | priority (spec layout).
- * We pin the high word to 0xFFFFFFFF (max → effectively non-expiring, matching iOS &
- * Android) and use the low word as a wall-clock-floored monotonic priority, so channel
- * supersession is driven by the priority regardless of how the store compares the field.
- * Returns a value strictly greater than `current` (i.e. `max(current + 1, now-priority)`).
- */
-const NEVER_EXPIRE_HIGH = 0xffff_ffffn;
-export function nextExpiry(current: bigint): bigint {
-  const nowSecs = BigInt(Math.floor(Date.now() / 1000));
-  const timestampPriority = (NEVER_EXPIRE_HIGH << 32n) | nowSecs;
-  return timestampPriority > current ? timestampPriority : current + 1n;
-}
 
 type Subscriber = {
   codec: Codec<unknown>;
@@ -98,7 +98,6 @@ type OutgoingRequest = {
 type SessionState = {
   phase: 'initialization' | 'active' | 'failed';
   initError: Error | null;
-  expiry: bigint;
   outgoingRequest: OutgoingRequest | null;
   // Tracks every incoming request by its id with its own responded flag, so an
   // older request stays answerable after a newer one arrives, and an async
@@ -164,23 +163,6 @@ function makeDeferred(): PendingDelivery {
   return { resolve, reject, promise };
 }
 
-// Retry a submit on failure with a short backoff, up to `attemptsLeft` extra attempts.
-// A successful submit returns immediately (no delay on the happy path). `shouldRetry` is
-// re-checked before each retry: once the submission is superseded, aborted, or the session
-// is disposed it returns false, so a stale retry can never resurrect an old statement.
-function submitWithRetry(
-  submit: () => ResultAsync<void, Error>,
-  attemptsLeft: number,
-  shouldRetry: () => boolean,
-): ResultAsync<void, Error> {
-  return submit().orElse(error => {
-    if (attemptsLeft <= 0 || !shouldRetry()) return errAsync(error);
-    return ResultAsync.fromSafePromise(new Promise<void>(resolve => setTimeout(resolve, RETRY_DELAY_MS))).andThen(() =>
-      !shouldRetry() ? errAsync(error) : submitWithRetry(submit, attemptsLeft - 1, shouldRetry),
-    );
-  });
-}
-
 export function createSession({
   localAccount,
   remoteAccount,
@@ -188,10 +170,14 @@ export function createSession({
   encryption,
   prover,
   sessionKey,
+  allocator = createExpiryAllocator(),
   maxRequestSize = DEFAULT_MAX_REQUEST_SIZE,
 }: SessionParams): Session {
   const outgoingSessionId = createSessionId(sessionKey, localAccount, remoteAccount);
   const incomingSessionId = createSessionId(sessionKey, remoteAccount, localAccount);
+  // Session-constant channel hashes — derived once so retries don't re-hash them per attempt.
+  const requestChannel = createRequestChannel(outgoingSessionId);
+  const responseChannel = createResponseChannel(outgoingSessionId);
 
   // Message bytes must fit within the statement limit minus the fixed wire overhead.
   const maxPayloadSize = Math.max(0, maxRequestSize - STATEMENT_OVERHEAD);
@@ -199,7 +185,6 @@ export function createSession({
   const state: SessionState = {
     phase: 'initialization',
     initError: null,
-    expiry: 0n,
     outgoingRequest: null,
     incomingRequests: new Map(),
     messageQueue: [],
@@ -220,31 +205,26 @@ export function createSession({
   // latest is live — a retry for an older one must not resurrect it).
   let lastResponseRequestId: string | null = null;
 
-  // Submit on `channel`/`topicSessionId` at the next (strictly increasing) expiry.
+  // Encrypt, then submit on `channel`/`topicSessionId` at the allocator's next (strictly
+  // increasing) expiry. A priority rejection does NOT resync the allocator here — each caller
+  // raises the floor to the chain-reported minimum (the submitWithRetry `onPriorityError` hooks
+  // below, and the one-shot clear in clearOutgoingStatement), so the retry — and every later
+  // submit — clears it.
   function submitStatementData(
     channel: Uint8Array,
     topicSessionId: SessionId,
     data: Uint8Array,
   ): ResultAsync<void, Error> {
-    state.expiry = nextExpiry(state.expiry);
-    const expiry = state.expiry;
-    return encryption
-      .encrypt(data)
-      .map<Statement>(encrypted => ({
-        expiry,
-        channel: toHex(channel) as `0x${string}`,
-        topics: [toHex(topicSessionId) as `0x${string}`],
+    return encryption.encrypt(data).asyncAndThen(encrypted =>
+      submitStatementOnce({
+        statementStore,
+        prover,
+        allocator,
+        channel,
+        topics: [topicSessionId],
         data: encrypted,
-      }))
-      .asyncAndThen(prover.generateMessageProof)
-      .andThen(statementStore.submitStatement)
-      .orElse(error => {
-        // The chain is the source of truth for a channel's priority. If our in-memory counter
-        // drifted behind it (a prior run, another writer, or propagation lag), resync to the
-        // reported minimum so the retry — and every later submit — clears it.
-        if (error instanceof ExpiryTooLowError && error.min > state.expiry) state.expiry = error.min;
-        return errAsync(error);
-      });
+      }),
+    );
   }
 
   // Settle and remove the pending-delivery entries for the given tokens.
@@ -258,30 +238,42 @@ export function createSession({
     }
   }
 
+  // Session retry policy (this and every submitWithRetry call below): priority errors
+  // (ExpiryTooLow / AccountFull) are retried with `priorityAttempts: 'unbounded'` — they never
+  // consume the transient-failure budget, because the `onPriorityError` hook raises the allocator
+  // floor above the chain-reported minimum, so the next attempt submits higher. We keep at it
+  // until the statement lands or the submission is superseded; once superseded, a priority
+  // rejection is swallowed as success (it merely lost the channel race to a newer, higher-priority
+  // statement). The upshot: priority errors never surface to session callers. Other errors keep
+  // the bounded retry and propagate when exhausted. `shouldRetry` is re-checked before each retry:
+  // once the submission is superseded, aborted, or the session is disposed it returns false, so a
+  // stale retry can never resurrect an old statement.
   function encodeAndSubmitRequest(requestId: string, messages: Uint8Array[]): void {
     encodeStatementData({ tag: 'request', value: { requestId, data: messages } })
       .asyncAndThen(data =>
-        submitWithRetry(
-          () => submitStatementData(createRequestChannel(outgoingSessionId), outgoingSessionId, data),
-          MAX_SUBMIT_RETRIES,
+        submitWithRetry(() => submitStatementData(requestChannel, outgoingSessionId, data), {
+          attempts: MAX_SUBMIT_RETRIES,
+          priorityAttempts: 'unbounded',
+          delaysMs: RETRY_DELAY_MS,
+          // Adopt the chain-reported floor so the next attempt submits strictly above it.
+          onPriorityError: error => allocator.raiseFloor(error.min),
           // Only keep retrying while this is still the live submission (not superseded by a
           // newer retransmit, aborted via clearOutgoingStatement, or disposed).
-          () => !disposed && state.outgoingRequest?.requestIds.at(-1) === requestId,
-        ),
+          shouldRetry: () => !disposed && state.outgoingRequest?.requestIds.at(-1) === requestId,
+        }),
       )
       .mapErr(e => {
-        if (disposed) return;
-        console.error('submitRequest failed:', e);
-        // Retries are exhausted. If this is still the live submission (not already
-        // superseded by a newer retransmit), the request never landed — fail its
-        // waiters rather than let them hang. A superseded older submission failing
-        // is expected and must NOT reject, since the newer one carries the same tokens.
+        // Priority errors never reach here (see the policy note above), so this is a genuine
+        // failure. If this submission was already superseded by a newer retransmit (same tokens)
+        // it is not the live request's concern — drop it silently; the newer one carries the
+        // waiters. Otherwise the bounded retries are exhausted on the LIVE submission: the
+        // request never landed, so fail its waiters rather than let them hang.
         const outgoing = state.outgoingRequest;
-        if (outgoing && outgoing.requestIds[outgoing.requestIds.length - 1] === requestId) {
-          settleTokens(outgoing.tokens, deferred => deferred.reject(e));
-          state.outgoingRequest = null;
-          processMessageQueue();
-        }
+        if (disposed || !outgoing || outgoing.requestIds.at(-1) !== requestId) return;
+        console.error('submitRequest failed:', e);
+        settleTokens(outgoing.tokens, deferred => deferred.reject(e));
+        state.outgoingRequest = null;
+        processMessageQueue();
       });
   }
 
@@ -489,13 +481,12 @@ export function createSession({
     for (const s of ownStatements) {
       if (s.expiry !== undefined && s.expiry > maxExpiry) maxExpiry = s.expiry;
     }
-    // Never regress the counter. The query is a snapshot taken when init() began; a statement
-    // submitted while init was in flight (e.g. an auto-ACK for a peer request that arrived during
-    // the query) has already advanced both state.expiry and the on-chain channel past that
-    // snapshot. Overwriting unconditionally would drop the counter below the on-chain priority,
-    // making the next submit collide at an equal expiry.
-    const seeded = nextExpiry(maxExpiry);
-    if (seeded > state.expiry) state.expiry = seeded;
+    // Adopt the snapshot's maximum as the allocator floor. raiseFloor is monotonic — the floor
+    // never regresses — so a statement submitted while init was in flight (e.g. an auto-ACK for a
+    // peer request that arrived during the query) keeps the counter ahead of this snapshot, the
+    // same guarantee the old conditional seeding gave. The next submit then draws strictly above
+    // the seen on-chain maximum and at least the wall-clock priority, so it cannot collide at an equal expiry.
+    allocator.raiseFloor(maxExpiry);
 
     for (const s of [...ownStatements, ...peerStatements]) {
       if (s.data) state.seenStatements.add(toHex(s.data));
@@ -507,6 +498,7 @@ export function createSession({
       ).then(outcomes => outcomes.map(o => (o.kind === 'decoded' ? o.data : null)).filter(nonNullable));
 
     const [ownDecoded, peerDecoded] = await Promise.all([decodeAll(ownStatements), decodeAll(peerStatements)]);
+    if (disposed) return;
 
     // Both parties publish on their own outgoing topic, so the OUTGOING query returns our
     // requests + OUR responses, and the INCOMING query returns the peer's requests + the
@@ -557,6 +549,8 @@ export function createSession({
     },
 
     submitRequestMessage<T>(codec: Codec<T>, message: T) {
+      if (disposed) return errAsync(new Error(SESSION_DISPOSED));
+
       const encode = fromThrowable(codec.enc, toError);
       const encodedResult = encode(message);
       if (encodedResult.isErr()) return errAsync(encodedResult.error);
@@ -587,6 +581,7 @@ export function createSession({
     },
 
     submitResponseMessage(requestId: string, responseCode: ResponseStatus) {
+      if (disposed) return errAsync(new Error(SESSION_DISPOSED));
       const incoming = state.incomingRequests.get(requestId);
       if (!incoming) return errAsync(new Error(`No incoming request with id ${requestId}`));
       if (incoming.responded) {
@@ -605,18 +600,30 @@ export function createSession({
       // Responses go on OUR outgoing topic/response-channel (per spec: the responder
       // publishes on SessionId(self, peer)); the requester reads them from its incoming topic.
       return (
-        submitWithRetry(
-          () => submitStatementData(createResponseChannel(outgoingSessionId), outgoingSessionId, encoded.value),
-          MAX_SUBMIT_RETRIES,
+        submitWithRetry(() => submitStatementData(responseChannel, outgoingSessionId, encoded.value), {
+          attempts: MAX_SUBMIT_RETRIES,
+          priorityAttempts: 'unbounded',
+          delaysMs: RETRY_DELAY_MS,
+          // Adopt the chain-reported floor so the next attempt submits strictly above it.
+          onPriorityError: error => allocator.raiseFloor(error.min),
           // Stop retrying once a newer response supersedes this one (shared response channel) or disposed.
-          () => !disposed && lastResponseRequestId === requestId,
-        )
-          // Answered: it no longer needs replaying to future subscribers.
-          .andTee(() => pruneBufferedRequest(requestId))
+          shouldRetry: () => !disposed && lastResponseRequestId === requestId,
+        })
           .orElse(error => {
+            // Priority errors never reach here (see the policy note above), so this is a genuine
+            // failure. If this is no longer the latest response (superseded) or the session is
+            // disposed, keep the request marked answered — re-answering would only clobber the
+            // newer response — and absorb the error. NOTE: the shared response channel still only
+            // exposes the latest response to the peer, so reliably ACKing several outstanding
+            // requests needs the protocol-level fix tracked separately.
+            if (disposed || lastResponseRequestId !== requestId) return okAsync<void, Error>(undefined);
+            // The live response genuinely failed after exhausting retries — roll back so a later
+            // peer retransmit can still be answered, and surface the error.
             incoming.responded = false;
             return errAsync(error);
           })
+          // Answered (or absorbed as such): it no longer needs replaying to future subscribers.
+          .andTee(() => pruneBufferedRequest(requestId))
       );
     },
 
@@ -725,9 +732,17 @@ export function createSession({
 
       // Supersede the live batch with an empty one. Use submitStatementData so the
       // empty statement goes out at a STRICTLY higher expiry — the store rejects an
-      // equal-or-lower expiry on the same channel, so reusing state.expiry would
-      // leave the original request live on-chain.
-      return submitStatementData(createRequestChannel(outgoingSessionId), outgoingSessionId, encoded.value);
+      // equal-or-lower expiry on the same channel, so reusing the last allocated expiry
+      // would leave the original request live on-chain. One shot, no retry (clearing is a
+      // supersede, not a request that must land); a priority rejection (ExpiryTooLow /
+      // AccountFull) means the channel already advanced past us, so the clear already
+      // happened → absorb it as success. No retry loop here means no onPriorityError hook, so
+      // resync the allocator inline: adopt the chain floor before absorbing, so later submits stay above it.
+      return submitStatementData(requestChannel, outgoingSessionId, encoded.value).orElse(error => {
+        if (!isPriorityTooLow(error)) return errAsync(error);
+        allocator.raiseFloor(error.min);
+        return okAsync<void, Error>(undefined);
+      });
     },
 
     dispose() {
@@ -744,9 +759,9 @@ export function createSession({
       state.messageQueue = [];
       // Settle any waitForRequestMessage() promises so callers unwind instead of
       // hanging forever. Snapshot first — rejecting mutates the set.
-      for (const rejectWaiter of [...requestWaiters]) rejectWaiter(new Error('Session disposed'));
+      for (const rejectWaiter of [...requestWaiters]) rejectWaiter(new Error(SESSION_DISPOSED));
       requestWaiters.clear();
-      rejectAllPending(new Error('Session disposed'));
+      rejectAllPending(new Error(SESSION_DISPOSED));
     },
   };
 
