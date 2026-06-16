@@ -1,3 +1,33 @@
+## 0.8.10 (2026-06-16)
+
+### 🩹 Fixes
+
+- **host-chat:** update account service params
+
+### ❤️ Thank You
+
+- Sergey Zhuravlev @johnthecat
+
+## 0.8.9 (2026-06-15)
+
+### 🩹 Fixes
+
+- **host-container:** a TruApi-routed transaction broadcast no longer abandons itself — the chain connection is now held for the lifetime of the broadcast (until a matching `transaction_v1_stop`) instead of being torn down immediately, so transactions are actually included. Duplicate/unknown stops are idempotent no-ops.
+
+### ❤️ Thank You
+
+- Sergey Zhuravlev @johnthecat
+
+## 0.8.8 (2026-06-15)
+
+### 🚀 Features
+
+- **host-papp:** the SSO session now supports legacy sign requests. `UserSession` gains `signRawLegacy` (sign raw `Bytes`/`Payload` for a plain `AccountId`) and `createTransactionLegacy` (build a `LegacyTransaction`).
+
+### ❤️ Thank You
+
+- @valentunn
+
 ## 0.8.7 (2026-06-06)
 
 ### 🚀 Features

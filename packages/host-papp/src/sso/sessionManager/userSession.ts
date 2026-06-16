@@ -15,17 +15,22 @@ import { toError } from '../../helpers/utils.js';
 import type { Callback } from '../../types.js';
 import type { StoredUserSession } from '../userSessionRepository.js';
 
-import type { CreateTransactionRequest } from './scale/createTransaction.js';
+import type { CreateTransactionLegacyRequest, CreateTransactionRequest } from './scale/createTransaction.js';
 import type { RemoteMessage } from './scale/remoteMessage.js';
 import { RemoteMessageCodec } from './scale/remoteMessage.js';
 import type { ApAllocationOutcome, ResourceAllocationRequest } from './scale/resourceAllocation.js';
-import type { SigningPayloadRequest, SigningPayloadResponseData, SigningRawRequest } from './scale/signing.js';
+import type {
+  SignRawLegacyRequest,
+  SigningPayloadRequest,
+  SigningPayloadResponseData,
+  SigningRawRequest,
+} from './scale/signing.js';
 
 // Timeout for the inner queue task. Without it the queue wedges forever when
 // the remote signer doesn't respond — e.g. the request
 // payload is for an SDK version the mobile app doesn't support yet. After
 // this timeout the queue task fails, freeing the pool for the next request.
-const QUEUE_TASK_TIMEOUT_MS = 180_000;
+const QUEUE_TASK_TIMEOUT_MS = 240_000;
 // Mobile SSO statements allow 500 KiB total; keep headroom for statement/session overhead.
 const MAX_SSO_REQUEST_SIZE = 498 * 1024;
 
@@ -111,7 +116,9 @@ export type UserSession = StoredUserSession & {
   abortPendingRequests(): ResultAsync<void, Error>;
   signPayload(payload: SigningPayloadRequest): ResultAsync<SigningPayloadResponseData, Error>;
   signRaw(payload: SigningRawRequest): ResultAsync<SigningPayloadResponseData, Error>;
+  signRawLegacy(payload: SignRawLegacyRequest): ResultAsync<Uint8Array, Error>;
   createTransaction(payload: CreateTransactionRequest): ResultAsync<Uint8Array, Error>;
+  createTransactionLegacy(payload: CreateTransactionLegacyRequest): ResultAsync<Uint8Array, Error>;
   getRingVrfAlias(
     productAccountId: CodecType<typeof ProductAccountId>,
     productId: string,
@@ -231,10 +238,42 @@ export function createUserSession({
       });
     },
 
+    signRawLegacy(payload) {
+      return enqueue(() => {
+        const messageId = nanoid();
+        const data = enumValue('v1', enumValue('SignRawLegacyRequest', payload));
+        emitHostAction(messageId, actionKindFromMessageData(data), userSession.id);
+
+        const responseFilter = (message: RemoteMessage) => {
+          if (
+            message.data.tag === 'v1' &&
+            message.data.value.tag === 'SignRawLegacyResponse' &&
+            message.data.value.value.respondingTo === messageId
+          ) {
+            return message.data.value.value.signature;
+          }
+        };
+
+        const request = session.request(RemoteMessageCodec, { messageId, data });
+        const reply = session.waitForRequestMessage(RemoteMessageCodec, responseFilter);
+
+        const inner = awaitReplyOrAckFailure(request, reply).andThen(message => {
+          if (message.success) {
+            return ok(message.value);
+          } else {
+            return err(new Error(message.value));
+          }
+        });
+
+        return withHostActionTrace(withQueueTimeout(inner, 'signRawLegacy'), messageId, userSession.id);
+      });
+    },
+
     createTransaction(payload) {
       return enqueue(() => {
         const messageId = nanoid();
         const data = enumValue('v1', enumValue('CreateTransactionRequest', payload));
+        emitHostAction(messageId, actionKindFromMessageData(data), userSession.id);
 
         const responseFilter = (message: RemoteMessage) => {
           if (
@@ -257,7 +296,38 @@ export function createUserSession({
           }
         });
 
-        return withQueueTimeout(inner, 'createTransaction');
+        return withHostActionTrace(withQueueTimeout(inner, 'createTransaction'), messageId, userSession.id);
+      });
+    },
+
+    createTransactionLegacy(payload) {
+      return enqueue(() => {
+        const messageId = nanoid();
+        const data = enumValue('v1', enumValue('CreateTransactionLegacyRequest', payload));
+        emitHostAction(messageId, actionKindFromMessageData(data), userSession.id);
+
+        const responseFilter = (message: RemoteMessage) => {
+          if (
+            message.data.tag === 'v1' &&
+            message.data.value.tag === 'CreateTransactionResponse' &&
+            message.data.value.value.respondingTo === messageId
+          ) {
+            return message.data.value.value.signedTransaction;
+          }
+        };
+
+        const request = session.request(RemoteMessageCodec, { messageId, data });
+        const reply = session.waitForRequestMessage(RemoteMessageCodec, responseFilter);
+
+        const inner = awaitReplyOrAckFailure(request, reply).andThen(message => {
+          if (message.success) {
+            return ok(message.value);
+          } else {
+            return err(new Error(message.value));
+          }
+        });
+
+        return withHostActionTrace(withQueueTimeout(inner, 'createTransactionLegacy'), messageId, userSession.id);
       });
     },
 
@@ -300,6 +370,7 @@ export function createUserSession({
       return enqueue(() => {
         const messageId = nanoid();
         const data = enumValue('v1', enumValue('ResourceAllocationRequest', payload));
+        emitHostAction(messageId, actionKindFromMessageData(data), userSession.id);
 
         const responseFilter = (message: RemoteMessage) => {
           if (
@@ -318,7 +389,7 @@ export function createUserSession({
           result.success ? ok(result.value) : err(new Error(result.value)),
         );
 
-        return withQueueTimeout(inner, 'requestResourceAllocation');
+        return withHostActionTrace(withQueueTimeout(inner, 'requestResourceAllocation'), messageId, userSession.id);
       });
     },
 
@@ -402,7 +473,7 @@ export function createUserSession({
     abortPendingRequests() {
       // Drop the whole request queue: aborting the shared signal rejects the
       // in-flight task and every request queued behind it, freeing the single
-      // slot immediately instead of waiting out the per-task 180s timeout. Swap
+      // slot immediately instead of waiting out the per-task timeout. Swap
       // in a fresh controller so subsequent requests aren't pre-aborted.
       requestAbort.abort(new Error('Session request aborted'));
       requestAbort = new AbortController();
